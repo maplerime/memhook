@@ -286,6 +286,12 @@ int main(int argc, char **argv) {
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd));
         setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
         setsockopt(cfd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
+        // detect a dead/killed client so its buffers get reclaimed (~30s)
+        int ka = 1, idle = 15, intvl = 5, cnt = 3;
+        setsockopt(cfd, SOL_SOCKET,  SO_KEEPALIVE,  &ka,   sizeof(ka));
+        setsockopt(cfd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle, sizeof(idle));
+        setsockopt(cfd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+        setsockopt(cfd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,  sizeof(cnt));
         fprintf(stderr, "memserver: client connected from %s:%d\n",
                 inet_ntoa(ca.sin_addr), ntohs(ca.sin_port));
         pthread_t th;
