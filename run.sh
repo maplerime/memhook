@@ -18,7 +18,7 @@ fi
 echo "using hook: $HOOK" >&2
 
 LLAMA=/root/llama.cpp
-MODEL=$LLAMA/models/Qwen2.5-32B-Instruct-Q8_0.gguf
+MODEL=${MODEL:-$LLAMA/models/Llama-3.3-70B-Instruct-Q3_K_M.gguf}   # 70B on a 23GB GPU via the hook
 
 export MEMHOOK_HOST=${MEMHOOK_HOST:-127.0.0.1}
 export MEMHOOK_PORT=${MEMHOOK_PORT:-9797}

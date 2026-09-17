@@ -22,6 +22,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 #include <signal.h>
 
 #include "proto.h"
@@ -33,8 +34,9 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 struct alloc {
     uint64_t id;
-    char     name[64];
-    int      fd;
+    char     name[64];   // zerocopy: shm object name
+    int      fd;         // zerocopy: shm fd, else -1
+    char    *data;       // stream: master byte buffer, else NULL
     size_t   size;
     struct alloc *next;
 };
@@ -80,6 +82,7 @@ static void *serve(void *arg) {
     int cfd = (int)(intptr_t) arg;
     struct alloc *head = NULL;
     char tb[32];
+    uint64_t written = 0, last_logged = 0;   // stream bytes received on this connection
 
     for (;;) {
         struct msg_req req;
@@ -107,11 +110,27 @@ static void *serve(void *arg) {
                 continue;
             }
 
-            int paged = (req.flags & FLAG_PAGED) != 0;
+            int paged  = (req.flags & FLAG_PAGED)  != 0;
+            int stream = (req.flags & FLAG_STREAM) != 0;
             char name[64] = "";
             int  fd = -1;
+            char *data = NULL;
+            const char *tag = "";
 
-            if (!paged) {
+            if (stream) {
+                data = calloc(1, size);   // master copy (zeroed so weight padding reads back as 0)
+                if (!data) {
+                    pthread_mutex_lock(&g_lock); g_total -= size; pthread_mutex_unlock(&g_lock);
+                    resp.status = ST_NOMEM;
+                    full_write(cfd, &resp, sizeof(resp));
+                    ts(tb, sizeof(tb));
+                    fprintf(stderr, "%s  ALLOC %10zu B  FAILED: malloc\n", tb, size);
+                    continue;
+                }
+                tag = "[stream]";
+            } else if (paged) {
+                tag = "[paged/managed]";
+            } else {
                 snprintf(name, sizeof(name), "/memhook.%d.%llu",
                          (int) getpid(), (unsigned long long) id);
                 fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
@@ -126,10 +145,11 @@ static void *serve(void *arg) {
                     fprintf(stderr, "%s  ALLOC %10zu B  FAILED: %s\n", tb, size, strerror(errno));
                     continue;
                 }
+                tag = name;
             }
 
             struct alloc *a = calloc(1, sizeof(*a));
-            a->id = id; a->fd = fd; a->size = size;
+            a->id = id; a->fd = fd; a->data = data; a->size = size;
             snprintf(a->name, sizeof(a->name), "%s", name);
             a->next = head; head = a;
 
@@ -142,8 +162,7 @@ static void *serve(void *arg) {
 
             ts(tb, sizeof(tb));
             fprintf(stderr, "%s  ALLOC %10zu B  id=%llu  %-16s (pool now %.2f GiB)\n",
-                    tb, size, (unsigned long long) id,
-                    paged ? "[paged/managed]" : name, g_total / 1073741824.0);
+                    tb, size, (unsigned long long) id, tag, g_total / 1073741824.0);
 
         } else if (req.op == OP_FREE) {
             struct alloc **pp = &head, *a = NULL;
@@ -153,6 +172,7 @@ static void *serve(void *arg) {
             }
             if (a) {
                 if (a->fd >= 0) { shm_unlink(a->name); close(a->fd); }
+                free(a->data);
                 pthread_mutex_lock(&g_lock);
                 g_total -= a->size;
                 pthread_mutex_unlock(&g_lock);
@@ -166,6 +186,50 @@ static void *serve(void *arg) {
                 resp.status = ST_NOTFOUND;
             }
             full_write(cfd, &resp, sizeof(resp));
+
+        } else if (req.op == OP_WRITE) {
+            struct alloc *a = NULL;
+            for (struct alloc *p = head; p; p = p->next)
+                if (p->id == req.id) { a = p; break; }
+            size_t   len = req.size;
+            uint64_t off = req.offset;
+            int ok = (a && a->data && off + len <= a->size);
+            if (ok) {
+                if (full_read(cfd, a->data + off, len) != 0) break;   // bytes land in master buffer
+                written += len;
+                if (written >> 30 != last_logged >> 30) {             // log each new GiB
+                    last_logged = written;
+                    ts(tb, sizeof(tb));
+                    fprintf(stderr, "%s  WRITE received %.2f GiB total (over socket)\n",
+                            tb, written / 1073741824.0);
+                }
+                resp.status = ST_OK;
+            } else {
+                char sink[65536];                                     // drain to keep stream aligned
+                size_t rem = len, bad = 0;
+                while (rem) {
+                    size_t c = rem < sizeof(sink) ? rem : sizeof(sink);
+                    if (full_read(cfd, sink, c) != 0) { bad = 1; break; }
+                    rem -= c;
+                }
+                if (bad) break;
+                resp.status = ST_NOTFOUND;
+            }
+            resp.id = req.id;
+            full_write(cfd, &resp, sizeof(resp));
+
+        } else if (req.op == OP_READ) {
+            struct alloc *a = NULL;
+            for (struct alloc *p = head; p; p = p->next)
+                if (p->id == req.id) { a = p; break; }
+            size_t   len = req.size;
+            uint64_t off = req.offset;
+            int ok = (a && a->data && off + len <= a->size);
+            resp.status = ok ? ST_OK : ST_NOTFOUND;
+            resp.id     = req.id;
+            if (full_write(cfd, &resp, sizeof(resp)) != 0) break;
+            if (ok && full_write(cfd, a->data + off, len) != 0) break;  // send bytes back
+
         } else {
             resp.status = ST_BADREQ;
             full_write(cfd, &resp, sizeof(resp));
@@ -176,6 +240,7 @@ static void *serve(void *arg) {
     while (head) {
         struct alloc *a = head; head = a->next;
         if (a->fd >= 0) { shm_unlink(a->name); close(a->fd); }
+        free(a->data);
         pthread_mutex_lock(&g_lock);
         g_total -= a->size;
         pthread_mutex_unlock(&g_lock);
@@ -217,6 +282,10 @@ int main(int argc, char **argv) {
         socklen_t cl = sizeof(ca);
         int cfd = accept(sfd, (struct sockaddr *) &ca, &cl);
         if (cfd < 0) { if (errno == EINTR) continue; perror("accept"); break; }
+        int nd = 1, buf = 16 << 20;
+        setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd));
+        setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+        setsockopt(cfd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
         fprintf(stderr, "memserver: client connected from %s:%d\n",
                 inet_ntoa(ca.sin_addr), ntohs(ca.sin_port));
         pthread_t th;

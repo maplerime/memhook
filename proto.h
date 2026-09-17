@@ -12,6 +12,8 @@
 enum {
     OP_ALLOC = 1,
     OP_FREE  = 2,
+    OP_WRITE = 3,   // stream mode: push bytes into the server-side master buffer
+    OP_READ  = 4,   // stream mode: pull bytes back from the server-side master buffer
 };
 
 enum {
@@ -25,16 +27,20 @@ enum {
     // paged mode: client backs the bytes with CUDA managed memory and the
     // GPU driver demand-pages them. The server only grants/accounts the
     // budget and returns no shm object (name_len == 0).
-    FLAG_PAGED = 1u,
+    FLAG_PAGED  = 1u,
+    // stream mode: server keeps a master byte buffer that the client fills
+    // with OP_WRITE over the socket. No shm, no address mapping.
+    FLAG_STREAM = 2u,
 };
 
 // Fixed request header. x86-64 is little-endian; client and server share it.
 struct msg_req {
     uint32_t magic;
     uint32_t op;
-    uint64_t size;   // OP_ALLOC: bytes wanted
-    uint64_t id;     // OP_FREE:  allocation id to release
-    uint32_t flags;  // OP_ALLOC: FLAG_PAGED etc.
+    uint64_t size;   // OP_ALLOC: bytes wanted; OP_WRITE: payload length
+    uint64_t id;     // OP_FREE / OP_WRITE: allocation id
+    uint64_t offset; // OP_WRITE: byte offset into the allocation
+    uint32_t flags;  // OP_ALLOC: FLAG_PAGED / FLAG_STREAM
     uint32_t _pad;
 };
 

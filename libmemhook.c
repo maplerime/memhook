@@ -51,6 +51,7 @@ static cudaError_t (*real_cudaMalloc)(void **, size_t);
 static cudaError_t (*real_cudaMallocManaged)(void **, size_t, unsigned int);
 static cudaError_t (*real_cudaMemAdvise)(const void *, size_t, int, int);
 static cudaError_t (*real_cudaGetDevice)(int *);
+static cudaError_t (*real_cudaMemcpyAsync)(void *, const void *, size_t, enum cudaMemcpyKind, cudaStream_t);
 static cudaError_t (*real_cudaFree)(void *);
 static cudaError_t (*real_cudaHostRegister)(void *, size_t, unsigned int);
 static cudaError_t (*real_cudaHostUnregister)(void *);
@@ -63,15 +64,17 @@ static size_t g_min  = 1ULL << 30;
 static char   g_host[64] = "127.0.0.1";
 static int    g_port = MEMHOOK_PORT;
 static int    g_verbose = 0;
-static int    g_paged = 0;   // default: zerocopy (set MEMHOOK_MODE=paged for demand paging)
+
+enum { MODE_ZEROCOPY = 0, MODE_PAGED = 1, MODE_STREAM = 2 };
+static int    g_mode = MODE_ZEROCOPY;   // default; set MEMHOOK_MODE=paged|stream
 
 // one record per redirected allocation, keyed by the pointer we returned
 struct rec {
     void   *devptr;
-    void   *host;    // zerocopy: mmap base to unmap; paged: NULL
+    void   *host;    // zerocopy: mmap base to unmap; paged/stream: NULL
     size_t  size;
     uint64_t id;
-    int      paged;
+    int      mode;
     struct rec *next;
 };
 static struct rec *g_recs = NULL;
@@ -84,6 +87,7 @@ static void init_once(void) {
     real_cudaMallocManaged        = dlsym(RTLD_NEXT, "cudaMallocManaged");
     real_cudaMemAdvise            = dlsym(RTLD_NEXT, "cudaMemAdvise");
     real_cudaGetDevice            = dlsym(RTLD_NEXT, "cudaGetDevice");
+    real_cudaMemcpyAsync          = dlsym(RTLD_NEXT, "cudaMemcpyAsync");
     real_cudaFree                 = dlsym(RTLD_NEXT, "cudaFree");
     real_cudaHostRegister         = dlsym(RTLD_NEXT, "cudaHostRegister");
     real_cudaHostUnregister       = dlsym(RTLD_NEXT, "cudaHostUnregister");
@@ -98,10 +102,12 @@ static void init_once(void) {
     const char *v = getenv("MEMHOOK_VERBOSE");
     if (v) g_verbose = atoi(v);
     const char *mode = getenv("MEMHOOK_MODE");
-    if (mode && strcmp(mode, "paged") == 0) g_paged = 1;
+    if (mode && strcmp(mode, "paged")  == 0) g_mode = MODE_PAGED;
+    if (mode && strcmp(mode, "stream") == 0) g_mode = MODE_STREAM;
 
+    const char *mn = g_mode == MODE_PAGED ? "paged" : g_mode == MODE_STREAM ? "stream" : "zerocopy";
     LOGE("active: server=%s:%d  mode=%s  redirect >= %.2f MiB\n",
-         g_host, g_port, g_paged ? "paged" : "zerocopy", g_min / 1048576.0);
+         g_host, g_port, mn, g_min / 1048576.0);
 }
 
 static int full_read(int fd, void *buf, size_t n) {
@@ -186,6 +192,42 @@ static void server_free(uint64_t id) {
     if (full_read(g_sock, &resp, sizeof(resp)) != 0) { close(g_sock); g_sock = -1; }
 }
 
+// push len bytes at offset into the server-side master buffer (stream mode).
+// caller holds g_lock; best-effort (compute never depends on it).
+static void server_write(uint64_t id, uint64_t offset, const void *data, size_t len) {
+    if (g_sock < 0) return;
+    struct msg_req req;
+    memset(&req, 0, sizeof(req));
+    req.magic  = MEMHOOK_MAGIC;
+    req.op     = OP_WRITE;
+    req.id     = id;
+    req.offset = offset;
+    req.size   = len;
+    if (full_write(g_sock, &req, sizeof(req)) != 0)  { close(g_sock); g_sock = -1; return; }
+    if (full_write(g_sock, data, len) != 0)          { close(g_sock); g_sock = -1; return; }
+    struct msg_resp resp;
+    if (full_read(g_sock, &resp, sizeof(resp)) != 0) { close(g_sock); g_sock = -1; }
+}
+
+// pull len bytes at offset back from the server into dst (host-accessible,
+// e.g. managed memory). caller holds g_lock. returns 0 on success.
+static int server_read(uint64_t id, uint64_t offset, void *dst, size_t len) {
+    if (g_sock < 0) return -1;
+    struct msg_req req;
+    memset(&req, 0, sizeof(req));
+    req.magic  = MEMHOOK_MAGIC;
+    req.op     = OP_READ;
+    req.id     = id;
+    req.offset = offset;
+    req.size   = len;
+    if (full_write(g_sock, &req, sizeof(req)) != 0)  { close(g_sock); g_sock = -1; return -1; }
+    struct msg_resp resp;
+    if (full_read(g_sock, &resp, sizeof(resp)) != 0) { close(g_sock); g_sock = -1; return -1; }
+    if (resp.status != ST_OK) return -1;
+    if (full_read(g_sock, dst, len) != 0)            { close(g_sock); g_sock = -1; return -1; }
+    return 0;
+}
+
 // managed memory: server just grants, GPU driver demand-pages the bytes
 static cudaError_t alloc_paged(void **ptr, size_t size) {
     if (!real_cudaMallocManaged) return real_cudaMalloc(ptr, size);
@@ -218,12 +260,46 @@ static cudaError_t alloc_paged(void **ptr, size_t size) {
     }
 
     struct rec *r = calloc(1, sizeof(*r));
-    r->devptr = dev; r->host = NULL; r->size = size; r->id = id; r->paged = 1;
+    r->devptr = dev; r->host = NULL; r->size = size; r->id = id; r->mode = MODE_PAGED;
     r->next = g_recs; g_recs = r;
     pthread_mutex_unlock(&g_lock);
 
     *ptr = dev;
     LOGV("cudaMalloc(%.2f MiB) -> PAGED id=%llu ptr=%p\n",
+         size / 1048576.0, (unsigned long long) id, dev);
+    return cudaSuccess;
+}
+
+// stream: GPU-usable managed working copy, filled over the socket from the
+// server (see the cudaMemcpyAsync hook). No shm, no address mapping.
+static cudaError_t alloc_stream(void **ptr, size_t size) {
+    if (!real_cudaMallocManaged) return real_cudaMalloc(ptr, size);
+
+    pthread_mutex_lock(&g_lock);
+    char name[64];
+    uint64_t id = 0; size_t granted = 0;
+    if (server_alloc(size, FLAG_STREAM, name, sizeof(name), &id, &granted) != 0) {
+        pthread_mutex_unlock(&g_lock);
+        LOGE("server_alloc(%zu) failed, falling back to real cudaMalloc\n", size);
+        return real_cudaMalloc(ptr, size);
+    }
+
+    void *dev = NULL;
+    cudaError_t err = real_cudaMallocManaged(&dev, size, cudaMemAttachGlobal);
+    if (err != cudaSuccess) {
+        LOGE("cudaMallocManaged(%zu) failed: %d\n", size, err);
+        server_free(id);
+        pthread_mutex_unlock(&g_lock);
+        return err;
+    }
+
+    struct rec *r = calloc(1, sizeof(*r));
+    r->devptr = dev; r->host = NULL; r->size = size; r->id = id; r->mode = MODE_STREAM;
+    r->next = g_recs; g_recs = r;
+    pthread_mutex_unlock(&g_lock);
+
+    *ptr = dev;
+    LOGV("cudaMalloc(%.2f MiB) -> STREAM id=%llu ptr=%p\n",
          size / 1048576.0, (unsigned long long) id, dev);
     return cudaSuccess;
 }
@@ -273,7 +349,7 @@ static cudaError_t alloc_zerocopy(void **ptr, size_t size) {
     }
 
     struct rec *r = calloc(1, sizeof(*r));
-    r->devptr = dev; r->host = host; r->size = granted; r->id = id; r->paged = 0;
+    r->devptr = dev; r->host = host; r->size = granted; r->id = id; r->mode = MODE_ZEROCOPY;
     r->next = g_recs; g_recs = r;
     pthread_mutex_unlock(&g_lock);
 
@@ -286,7 +362,11 @@ static cudaError_t alloc_zerocopy(void **ptr, size_t size) {
 cudaError_t cudaMalloc(void **ptr, size_t size) {
     pthread_once(&g_once, init_once);
     if (size < g_min) return real_cudaMalloc(ptr, size);
-    return g_paged ? alloc_paged(ptr, size) : alloc_zerocopy(ptr, size);
+    switch (g_mode) {
+        case MODE_PAGED:  return alloc_paged(ptr, size);
+        case MODE_STREAM: return alloc_stream(ptr, size);
+        default:          return alloc_zerocopy(ptr, size);
+    }
 }
 
 cudaError_t cudaFree(void *ptr) {
@@ -302,11 +382,11 @@ cudaError_t cudaFree(void *ptr) {
         pthread_mutex_unlock(&g_lock);
         return real_cudaFree(ptr);
     }
-    if (r->paged) {
-        real_cudaFree(r->devptr);
-    } else {
+    if (r->mode == MODE_ZEROCOPY) {
         real_cudaHostUnregister(r->host);
         munmap(r->host, r->size);
+    } else {
+        real_cudaFree(r->devptr);   // paged and stream use managed memory
     }
     server_free(r->id);
     uint64_t id = r->id;
@@ -315,4 +395,37 @@ cudaError_t cudaFree(void *ptr) {
     LOGV("cudaFree(ptr=%p) -> id=%llu released\n", ptr, (unsigned long long) id);
     free(r);
     return cudaSuccess;
+}
+
+// Hook weight uploads: ggml loads tensors via cudaMemcpyAsync(H2D). In stream
+// mode, when the destination is inside one of our managed buffers, the bytes are
+// moved through the server: pushed to the master buffer (OP_WRITE), then pulled
+// back into the managed buffer (OP_READ). So the data the GPU computes on is
+// transported over the socket, not read from a local mapping. If the transport
+// fails, fall back to the real local copy so it still runs.
+cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count,
+                            enum cudaMemcpyKind kind, cudaStream_t stream) {
+    pthread_once(&g_once, init_once);
+
+    if (g_mode == MODE_STREAM && kind == cudaMemcpyHostToDevice) {
+        struct rec *hit = NULL;
+        pthread_mutex_lock(&g_lock);
+        for (struct rec *r = g_recs; r; r = r->next) {
+            if (r->mode == MODE_STREAM &&
+                dst >= r->devptr && (char *) dst + count <= (char *) r->devptr + r->size) {
+                hit = r;
+                break;
+            }
+        }
+        if (hit) {
+            uint64_t off = (char *) dst - (char *) hit->devptr;
+            server_write(hit->id, off, src, count);         // file bytes -> server (master)
+            int got = server_read(hit->id, off, dst, count); // server -> managed buffer (GPU)
+            pthread_mutex_unlock(&g_lock);
+            if (got == 0) return cudaSuccess;                // dst filled from the server
+            return real_cudaMemcpyAsync(dst, src, count, kind, stream);  // fallback
+        }
+        pthread_mutex_unlock(&g_lock);
+    }
+    return real_cudaMemcpyAsync(dst, src, count, kind, stream);
 }

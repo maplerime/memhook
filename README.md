@@ -22,21 +22,33 @@ interposed with `LD_PRELOAD`.
 
 - `memserver` (TCP) is the memory manager: it grants and accounts allocations
   against a budget (`MEMSERVER_MAX_BYTES`). Control travels over the network.
-- `libmemhook.so` interposes `cudaMalloc`/`cudaFree`. A request `>=` the threshold
-  is granted by the server; below it, it passes through to the real `cudaMalloc`
-  (stays in VRAM). Two data planes:
+- `libmemhook.so` interposes `cudaMalloc`, `cudaFree`, and `cudaMemcpyAsync`
+  (the last only used by stream mode). A request `>=` the threshold is granted by
+  the server; below it, it passes through to the real `cudaMalloc` (stays in VRAM).
+  Three data planes (`MEMHOOK_MODE`):
 
-  - `MEMHOOK_MODE=paged` (default): allocate the buffer as CUDA managed memory
-    (`cudaMallocManaged`). The GPU driver demand-pages it - only the layers in
-    use stay resident in VRAM, the rest live in host RAM and page in/out. Weights
-    are marked `cudaMemAdviseSetReadMostly` so evicted pages are dropped, not
-    written back. Fast, and needs no memlock. The server here only manages the
-    oversubscription budget; the bytes are CUDA-managed host RAM.
+  - `zerocopy` (default): the server creates a POSIX shm object; the client
+    `mmap`s it and `cudaHostRegister`s it so the GPU reads it in place over PCIe
+    (address mapping). The bytes physically live in the server pool, but every
+    access is latency bound, so it is slow. Needs a high `ulimit -l`.
 
-  - `MEMHOOK_MODE=zerocopy`: the server creates a POSIX shm object; the client
-    `mmap`s it and `cudaHostRegister`s it so the GPU reads it in place over PCIe.
-    The bytes physically live in the server pool, but every access is latency
-    bound, so it is very slow. Needs a high `ulimit -l`.
+  - `paged`: allocate the buffer as CUDA managed memory (`cudaMallocManaged`).
+    The GPU driver demand-pages it - only the layers in use stay resident in VRAM,
+    the rest live in host RAM and page in/out. Weights are marked
+    `cudaMemAdviseSetReadMostly`. No memlock. The server only accounts the budget;
+    the bytes are CUDA-managed host RAM.
+
+  - `stream`: network transport instead of address mapping. The client allocates
+    a managed working copy, and the `cudaMemcpyAsync` hook routes each weight
+    upload through the server: OP_WRITE pushes the bytes to the server master
+    buffer, then OP_READ pulls them back into the managed buffer. So the data the
+    GPU computes on is transported over the socket, not read from a local mapping.
+    (Falls back to the local copy only if the transport fails.) NOTE: this does
+    not save local memory - the GPU still needs a full-size local working copy -
+    so it does not extend capacity at the cudaMalloc layer. It is the transport
+    foundation for a real remote setup. To truly hold weights only remotely and
+    stream per-layer, the hook must move up to the ggml tensor/op level (know
+    which layer to prefetch).
 
 ## Measured (L4 23 GiB, Qwen2.5-32B Q8_0, weights 32 GiB oversubscribed)
 
@@ -65,7 +77,7 @@ or manually:
       ./build/bin/llama-cli -m models/Qwen2.5-32B-Instruct-Q8_0.gguf -ngl 999 -p "..." -n 16
 
 Env knobs: `MEMHOOK_HOST` (127.0.0.1), `MEMHOOK_PORT` (9797),
-`MEMHOOK_MIN_BYTES` (1 GiB), `MEMHOOK_MODE` (paged | zerocopy),
+`MEMHOOK_MIN_BYTES` (1 GiB), `MEMHOOK_MODE` (zerocopy | paged | stream),
 `MEMHOOK_READMOSTLY` (1), `MEMHOOK_VERBOSE` (0). Server: `MEMSERVER_MAX_BYTES`
 caps the pool.
 
